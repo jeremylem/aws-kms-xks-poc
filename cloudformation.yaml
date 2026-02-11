@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: XKS Proxy POC - ALB + EC2 deployment for AWS KMS External Key Store
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID (default VPC)
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets in at least 2 AZs
+
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the ALB HTTPS listener
+
+  KeyName:
+    Type: String
+    Default: EC2Tutorial2
+    Description: EC2 key pair name for SSH access
+
+  HostedZoneId:
+    Type: String
+    Description: Route53 hosted zone ID for the domain
+
+  DomainName:
+    Type: String
+    Default: xks.lemaire.tel
+    Description: Domain name for the XKS proxy endpoint
+
+Resources:
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS traffic to ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH from anywhere
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  XKSProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /xks-proxy/ec2
+      RetentionInDays: 3
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.nano
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}"
+      KeyName: !Ref KeyName
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: xks-proxy-poc
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          # 1. Install p11-kit (aarch64) + CloudWatch agent
+          dnf install -y p11-kit-server amazon-cloudwatch-agent
+
+          # 2. Verify p11-kit-client.so exists at expected path
+          ls -la /usr/lib64/pkcs11/p11-kit-client.so
+
+          # 3. Configure sshd for Unix socket forwarding
+          echo -e "\nStreamLocalBindUnlink yes" >> /etc/ssh/sshd_config
+          systemctl restart sshd
+
+          # 4. Create directories
+          mkdir -p /var/local/xks-proxy/.secret /var/local/xks-proxy/logs
+
+          # 5. Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/local/xks-proxy/logs/xks-proxy.log*",
+                      "log_group_name": "/xks-proxy/ec2",
+                      "log_stream_name": "{instance_id}/xks-proxy",
+                      "retention_in_days": 3
+                    },
+                    {
+                      "file_path": "/var/log/user-data.log",
+                      "log_group_name": "/xks-proxy/ec2",
+                      "log_stream_name": "{instance_id}/user-data",
+                      "retention_in_days": 3
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          CWEOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+          # 6. Create systemd service unit (but don't start - binary not yet deployed)
+          cat > /etc/systemd/system/xks-proxy.service << 'EOF'
+          [Unit]
+          Description=XKS Proxy Service
+          After=network.target
+          [Service]
+          Environment=XKS_PROXY_SETTINGS_TOML=/var/local/xks-proxy/.secret/settings.toml
+          Environment=RUST_BACKTRACE=1
+          Environment=P11_KIT_SERVER_ADDRESS=unix:path=/home/ec2-user/.p11-kit.sock
+          ExecStart=/usr/sbin/xks-proxy
+          Restart=on-failure
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable xks-proxy
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: xks-proxy-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: xks-proxy-tg
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2Instance
+      HealthCheckPath: /ping
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt ALB.CanonicalHostedZoneID
+        DNSName: !GetAtt ALB.DNSName
+
+Outputs:
+  EC2PublicIP:
+    Description: EC2 instance public IP for SSH tunnel and SCP
+    Value: !GetAtt EC2Instance.PublicIp
+
+  XKSProxyEndpoint:
+    Description: XKS Proxy HTTPS endpoint
+    Value: !Sub "https://${DomainName}"
+
+  CloudWatchLogGroup:
+    Description: CloudWatch log group for xks-proxy logs
+    Value: /xks-proxy/ec2

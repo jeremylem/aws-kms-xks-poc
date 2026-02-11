@@ -1,0 +1,48 @@
+# XKS Proxy configuration for EC2 + ALB deployment
+# ALB handles TLS termination, so the proxy listens on HTTP port 80.
+
+[server]
+ip = "0.0.0.0"
+port = 80
+region = "eu-west-3"
+service = "kms-xks-proxy"
+
+[server.tcp_keepalive]
+tcp_keepalive_secs = 60
+tcp_keepalive_retries = 3
+tcp_keepalive_interval_secs = 1
+
+[tracing]
+is_stdout_writer_enabled = true
+is_file_writer_enabled = true
+level = "DEBUG"
+directory = "/var/local/xks-proxy/logs"
+file_prefix = "xks-proxy.log"
+rotation_kind = "HOURLY"
+
+[security]
+is_sigv4_auth_enabled = true
+is_tls_enabled = false
+is_mtls_enabled = false
+
+[[external_key_stores]]
+uri_path_prefix = "/example/uri/path/prefix"
+sigv4_access_key_id = "BETWEEN2TENAND3TENCHARACTERS"
+sigv4_secret_access_key = "PleaseReplaceThisWithSomeSecretOfLength43To64"
+xks_key_id_set = ["foo"]
+
+[pkcs11]
+session_pool_max_size = 30
+session_pool_timeout_milli = 5000
+session_eager_close = false
+user_pin = "1234"
+PKCS11_HSM_MODULE = "/usr/lib64/pkcs11/p11-kit-client.so"
+context_read_timeout_milli = 5000
+
+[limits]
+max_plaintext_in_base64 = 8192
+max_aad_in_base64 = 16384
+
+[hsm_capabilities]
+can_generate_iv = false
+is_zero_iv_required = false
