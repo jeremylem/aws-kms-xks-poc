@@ -10,9 +10,23 @@ SoftHSM on a local machine serves as a stand-in for a real HSM for this POC. The
 
 ## Architecture
 
+### The intended model
+
+The idea behind XKS is straightforward: you run an HSM on your premises, front it with a service layer that implements the [XKS Proxy API](https://github.com/aws-samples/aws-kms-xks-proxy), and AWS KMS calls that proxy whenever it needs to encrypt or decrypt. The proxy talks to any Hardware Security Module that supports PKCS#11 v2.40 -- Thales Luna, Entrust nShield, or anything else that speaks the standard. AWS publishes the API spec and a reference implementation in Rust, so you can build and run your own.
+
+```
+S3 (SSE-KMS) → KMS → XKS Proxy → HSM (PKCS#11 v2.40)
+```
+
+In production, the proxy sits next to the HSM on the same network. Simple.
+
+### My workaround
+
+I don't have an HSM or a server with a public IP and a TLS certificate. So I stitched together a workaround to validate the concept: SoftHSM on my Mac as the HSM stand-in, an EC2 instance running the XKS proxy behind an ALB for TLS termination, and p11-kit remoting the PKCS#11 calls back to my machine over an SSH reverse tunnel.
+
 ![Architecture Diagram](architecture_diagram.png)
 
-When you upload a file to S3 with `--sse aws:kms`, KMS calls the xks-proxy's `/encrypt` endpoint. The proxy performs AES-256-GCM encryption via PKCS#11, remoted to SoftHSM on your machine through p11-kit over an SSH tunnel. Decryption follows the reverse path.
+Not what you'd run in production. But it proves the point: when S3 encrypts an object, the actual cryptographic operation happens on my machine, with a key that never leaves it.
 
 ## Components
 
@@ -21,7 +35,7 @@ When you upload a file to S3 with `--sse aws:kms`, KMS calls the xks-proxy's `/e
 | `cloudformation.yaml` | This repo | EC2 + ALB + Route53 + CloudWatch |
 | `configuration/settings.toml` | This repo | xks-proxy runtime config |
 | `create.sh` | This repo | One-shot deploy script |
-| `xks-proxy` | [aws-kms-xks-proxy](../aws-kms-xks-proxy/xks-axum/) | AWS XKS proxy (Rust, forked) |
+| `xks-proxy` | [aws-kms-xks-proxy](https://github.com/aws-samples/aws-kms-xks-proxy) | AWS XKS proxy (Rust) |
 | SoftHSM v2 | Machine (Homebrew) | Software HSM holding the AES-256 key |
 | p11-kit 0.26.2 | Machine + EC2 | PKCS#11 remoting over Unix sockets |
 
@@ -123,7 +137,7 @@ p11-kit server --provider /opt/homebrew/lib/softhsm/libsofthsm2.so "pkcs11:"
 
 Note the `P11_KIT_SERVER_ADDRESS` from the output (e.g., `unix:path=/var/folders/.../pkcs11-XXXX`).
 
-**Terminal 2 (Machine) -- SSH reverse tunnel:**
+**Terminal 2 (Machine), SSH reverse tunnel:**
 ```bash
 export P11_KIT_SERVER_ADDRESS=unix:path=/var/folders/.../pkcs11-XXXX  # from above
 
@@ -297,13 +311,3 @@ What Azure provides:
 - **Dedicated HSM:** Thales Luna in Azure (expensive, still in Azure)
 
 Azure's approach focuses on single-tenant Managed HSM with FIPS 140-3 Level 3 validation using confidential computing and Trusted Execution Environments, keeping everything within Azure's infrastructure.
-
-## Files
-
-```
-aws-kms-xks-poc/
-  cloudformation.yaml          # EC2 + ALB + Route53 + CloudWatch
-  configuration/settings.toml  # xks-proxy config (PKCS#11 module, SigV4 creds, etc.)
-  create.sh                    # One-shot deploy script
-  README.md                    # This file
-```
